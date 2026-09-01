@@ -61,40 +61,64 @@ jobs:
           output_root = pathlib.Path('/tmp/kronos-source')
           corrupt_file = pathlib.Path('/tmp/kronos-corrupt.txt')
           blob = archive.read_bytes()
+          signature = b'PK\x03\x04'
           offset = 0
           recovered = 0
           corrupt: list[str] = []
+          skipped_regions = 0
 
-          while offset + 30 <= len(blob) and blob[offset:offset + 4] == b'PK\x03\x04':
-              (
-                  _sig,
-                  _version,
-                  flags,
-                  method,
-                  _mtime,
-                  _mdate,
-                  expected_crc,
-                  compressed_size,
-                  uncompressed_size,
-                  name_len,
-                  extra_len,
-              ) = struct.unpack_from('<IHHHHHIIIHH', blob, offset)
-              header_end = offset + 30
-              name_start = header_end
-              name_end = name_start + name_len
-              data_start = name_end + extra_len
-              data_end = data_start + compressed_size
-              if data_end > len(blob):
-                  corrupt.append('<truncated-final-entry>')
-                  break
+          def resync(start: int) -> int | None:
+              candidate = blob.find(signature, start)
+              return None if candidate < 0 else candidate
 
-              name = blob[name_start:name_end].decode('utf-8', errors='strict')
-              relative = pathlib.PurePosixPath(name)
-              if relative.is_absolute() or '..' in relative.parts:
-                  raise SystemExit(f'unsafe archive path: {name!r}')
-              if flags & 0x1 or flags & 0x8:
+          while offset + 30 <= len(blob):
+              if blob[offset:offset + 4] != signature:
+                  next_offset = resync(offset + 1)
+                  if next_offset is None:
+                      break
+                  skipped_regions += 1
+                  offset = next_offset
+                  continue
+
+              try:
+                  (
+                      _sig,
+                      _version,
+                      flags,
+                      method,
+                      _mtime,
+                      _mdate,
+                      expected_crc,
+                      compressed_size,
+                      uncompressed_size,
+                      name_len,
+                      extra_len,
+                  ) = struct.unpack_from('<IHHHHHIIIHH', blob, offset)
+                  header_end = offset + 30
+                  name_start = header_end
+                  name_end = name_start + name_len
+                  data_start = name_end + extra_len
+                  data_end = data_start + compressed_size
+                  if not (0 < name_len <= 1024) or name_end > len(blob) or data_start > len(blob):
+                      raise ValueError('invalid local header')
+                  name = blob[name_start:name_end].decode('utf-8', errors='strict')
+                  relative = pathlib.PurePosixPath(name)
+                  if relative.is_absolute() or '..' in relative.parts:
+                      raise ValueError('unsafe archive path')
+              except (UnicodeDecodeError, ValueError, struct.error):
+                  next_offset = resync(offset + 4)
+                  if next_offset is None:
+                      break
+                  skipped_regions += 1
+                  offset = next_offset
+                  continue
+
+              if data_end > len(blob) or flags & 0x1 or flags & 0x8:
                   corrupt.append(name)
-                  offset = data_end
+                  next_offset = resync(data_start + 1)
+                  if next_offset is None:
+                      break
+                  offset = next_offset
                   continue
 
               compressed = blob[data_start:data_end]
@@ -104,14 +128,17 @@ jobs:
                   elif method == 8:
                       data = zlib.decompress(compressed, -zlib.MAX_WBITS)
                   else:
-                      raise ValueError(f'unsupported compression method {method}')
+                      raise ValueError('unsupported compression method')
                   if len(data) != uncompressed_size:
                       raise ValueError('size mismatch')
                   if (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc:
                       raise ValueError('CRC mismatch')
               except (ValueError, zlib.error):
                   corrupt.append(name)
-                  offset = data_end
+                  next_offset = resync(data_start + 1)
+                  if next_offset is None:
+                      break
+                  offset = next_offset
                   continue
 
               destination = output_root / relative
@@ -125,13 +152,14 @@ jobs:
 
           if recovered == 0:
               raise SystemExit('no recoverable ZIP entries found')
-          corrupt_file.write_text('\n'.join(corrupt) + ('\n' if corrupt else ''), encoding='utf-8')
+          corrupt_file.write_text('\n'.join(dict.fromkeys(corrupt)) + ('\n' if corrupt else ''), encoding='utf-8')
           print(f'recovered {recovered} intact files')
-          print(f'corrupt entries: {len(corrupt)}')
-          for name in corrupt:
+          unique_corrupt = list(dict.fromkeys(corrupt))
+          print(f'corrupt entries: {len(unique_corrupt)}')
+          for name in unique_corrupt:
               print(f'  - {name}')
-          if offset != len(blob):
-              print(f'trailing unparsed bytes: {len(blob) - offset}')
+          print(f'resync regions skipped: {skipped_regions}')
+          print(f'unparsed trailing bytes: {len(blob) - offset}')
           PY
           echo 'Recovered package manifest:'
           find /tmp/kronos-source -type f -printf '%P\n' | LC_ALL=C sort
