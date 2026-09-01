@@ -1,0 +1,66 @@
+name: Kronos Package CI
+
+on:
+  push:
+    paths:
+      - 'kronos-capital-os/**'
+      - '.github/workflows/kronos-package-ci.yml'
+  pull_request:
+    paths:
+      - 'kronos-capital-os/**'
+      - '.github/workflows/kronos-package-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify published checksum
+        working-directory: kronos-capital-os
+        run: sha256sum --check SHA256SUMS
+
+      - name: Verify ZIP integrity
+        run: unzip -t kronos-capital-os/Kronos_Capital_OS_Genesis_v0.1.zip
+
+      - name: Extract source for static verification
+        run: |
+          rm -rf /tmp/kronos-source
+          mkdir -p /tmp/kronos-source
+          unzip -q kronos-capital-os/Kronos_Capital_OS_Genesis_v0.1.zip -d /tmp/kronos-source
+          echo 'Tracked package manifest:'
+          find /tmp/kronos-source -type f -printf '%P\n' | LC_ALL=C sort
+
+      - name: Block embedded secrets
+        shell: bash
+        run: |
+          if find /tmp/kronos-source -type f \( -name '.env' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .; then
+            echo '::error::Packaged source contains a secret-bearing file type. Store credentials outside the repository.'
+            exit 1
+          fi
+          if grep -RIEq --binary-files=without-match '(-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,})' /tmp/kronos-source; then
+            echo '::error::Potential embedded credential detected in packaged source.'
+            exit 1
+          fi
+
+      - name: Python syntax verification
+        run: python -m compileall -q /tmp/kronos-source
+
+      - name: Require reviewable project metadata
+        shell: bash
+        run: |
+          test -n "$(find /tmp/kronos-source -name pyproject.toml -print -quit)" || {
+            echo '::error::No pyproject.toml found in packaged source.'
+            exit 1
+          }
+          test -n "$(find /tmp/kronos-source -name Makefile -print -quit)" || {
+            echo '::error::No Makefile found in packaged source.'
+            exit 1
+          }
