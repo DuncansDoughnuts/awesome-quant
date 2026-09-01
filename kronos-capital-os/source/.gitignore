@@ -1,0 +1,15 @@
+.env
+.env.runtime
+*.pem
+*.key
+*.crt
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+artifacts/
+*.sqlite
+*.db
+.DS_Store
+upstream/Kronos/
+!upstream/Kronos/README_FETCH.md
