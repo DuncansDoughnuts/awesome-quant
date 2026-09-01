@@ -1,0 +1,208 @@
+name: Kronos Package CI
+
+on:
+  push:
+    paths:
+      - 'kronos-capital-os/**'
+      - '.github/workflows/kronos-package-ci.yml'
+  pull_request:
+    paths:
+      - 'kronos-capital-os/**'
+      - '.github/workflows/kronos-package-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify published checksum
+        working-directory: kronos-capital-os
+        shell: bash
+        run: |
+          expected="$(awk 'NR==1 {print $1}' SHA256SUMS)"
+          actual="$(sha256sum Kronos_Capital_OS_Genesis_v0.1.zip | awk '{print $1}')"
+          echo "expected_sha256=$expected"
+          echo "actual_sha256=$actual"
+          test "$expected" = "$actual"
+
+      - name: Inspect original ZIP integrity
+        shell: bash
+        run: |
+          if unzip -t kronos-capital-os/Kronos_Capital_OS_Genesis_v0.1.zip >/tmp/zip-test.log 2>&1; then
+            echo 'ORIGINAL_ZIP_VALID=true' >> "$GITHUB_ENV"
+            echo 'Original ZIP is structurally valid.'
+          else
+            echo 'ORIGINAL_ZIP_VALID=false' >> "$GITHUB_ENV"
+            echo '::warning::Original ZIP is structurally invalid; recovering intact local records for inspection only.'
+          fi
+
+      - name: Recover intact source records
+        shell: bash
+        run: |
+          rm -rf /tmp/kronos-source /tmp/kronos-corrupt.txt
+          mkdir -p /tmp/kronos-source
+          python - <<'PY'
+          from __future__ import annotations
+
+          import binascii
+          import pathlib
+          import struct
+          import zlib
+
+          archive = pathlib.Path('kronos-capital-os/Kronos_Capital_OS_Genesis_v0.1.zip')
+          output_root = pathlib.Path('/tmp/kronos-source')
+          corrupt_file = pathlib.Path('/tmp/kronos-corrupt.txt')
+          blob = archive.read_bytes()
+          signature = b'PK\x03\x04'
+          offset = 0
+          recovered = 0
+          corrupt: list[str] = []
+          skipped_regions = 0
+
+          def resync(start: int) -> int | None:
+              candidate = blob.find(signature, start)
+              return None if candidate < 0 else candidate
+
+          while offset + 30 <= len(blob):
+              if blob[offset:offset + 4] != signature:
+                  next_offset = resync(offset + 1)
+                  if next_offset is None:
+                      break
+                  skipped_regions += 1
+                  offset = next_offset
+                  continue
+
+              try:
+                  (
+                      _sig,
+                      _version,
+                      flags,
+                      method,
+                      _mtime,
+                      _mdate,
+                      expected_crc,
+                      compressed_size,
+                      uncompressed_size,
+                      name_len,
+                      extra_len,
+                  ) = struct.unpack_from('<IHHHHHIIIHH', blob, offset)
+                  header_end = offset + 30
+                  name_start = header_end
+                  name_end = name_start + name_len
+                  data_start = name_end + extra_len
+                  data_end = data_start + compressed_size
+                  if not (0 < name_len <= 1024) or name_end > len(blob) or data_start > len(blob):
+                      raise ValueError('invalid local header')
+                  name = blob[name_start:name_end].decode('utf-8', errors='strict')
+                  relative = pathlib.PurePosixPath(name)
+                  if relative.is_absolute() or '..' in relative.parts:
+                      raise ValueError('unsafe archive path')
+              except (UnicodeDecodeError, ValueError, struct.error):
+                  next_offset = resync(offset + 4)
+                  if next_offset is None:
+                      break
+                  skipped_regions += 1
+                  offset = next_offset
+                  continue
+
+              if data_end > len(blob) or flags & 0x1 or flags & 0x8:
+                  corrupt.append(name)
+                  next_offset = resync(data_start + 1)
+                  if next_offset is None:
+                      break
+                  offset = next_offset
+                  continue
+
+              compressed = blob[data_start:data_end]
+              try:
+                  if method == 0:
+                      data = compressed
+                  elif method == 8:
+                      data = zlib.decompress(compressed, -zlib.MAX_WBITS)
+                  else:
+                      raise ValueError('unsupported compression method')
+                  if len(data) != uncompressed_size:
+                      raise ValueError('size mismatch')
+                  if (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc:
+                      raise ValueError('CRC mismatch')
+              except (ValueError, zlib.error):
+                  corrupt.append(name)
+                  next_offset = resync(data_start + 1)
+                  if next_offset is None:
+                      break
+                  offset = next_offset
+                  continue
+
+              destination = output_root / relative
+              if name.endswith('/'):
+                  destination.mkdir(parents=True, exist_ok=True)
+              else:
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(data)
+                  recovered += 1
+              offset = data_end
+
+          if recovered == 0:
+              raise SystemExit('no recoverable ZIP entries found')
+          corrupt_file.write_text('\n'.join(dict.fromkeys(corrupt)) + ('\n' if corrupt else ''), encoding='utf-8')
+          print(f'recovered {recovered} intact files')
+          unique_corrupt = list(dict.fromkeys(corrupt))
+          print(f'corrupt entries: {len(unique_corrupt)}')
+          for name in unique_corrupt:
+              print(f'  - {name}')
+          print(f'resync regions skipped: {skipped_regions}')
+          print(f'unparsed trailing bytes: {len(blob) - offset}')
+          PY
+          echo 'Recovered package manifest:'
+          find /tmp/kronos-source -type f -printf '%P\n' | LC_ALL=C sort
+
+      - name: Block embedded secrets in recovered files
+        shell: bash
+        run: |
+          if find /tmp/kronos-source -type f \( -name '.env' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .; then
+            echo '::error::Recovered source contains a secret-bearing file type. Store credentials outside the repository.'
+            exit 1
+          fi
+          if grep -RIEq --binary-files=without-match '(-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,})' /tmp/kronos-source; then
+            echo '::error::Potential embedded credential detected in recovered source.'
+            exit 1
+          fi
+
+      - name: Python syntax verification
+        run: python -m compileall -q /tmp/kronos-source
+
+      - name: Require project metadata
+        shell: bash
+        run: |
+          test -n "$(find /tmp/kronos-source -name pyproject.toml -print -quit)" || {
+            echo '::error::No recoverable pyproject.toml found.'
+            exit 1
+          }
+          test -n "$(find /tmp/kronos-source -name Makefile -print -quit)" || {
+            echo '::error::No recoverable Makefile found.'
+            exit 1
+          }
+
+      - name: Upload recovered source for remediation
+        uses: actions/upload-artifact@v7
+        with:
+          name: kronos-recovered-source
+          path: /tmp/kronos-source
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: Reject damaged release package
+        shell: bash
+        run: |
+          if [ "$ORIGINAL_ZIP_VALID" != 'true' ] || [ -s /tmp/kronos-corrupt.txt ]; then
+            echo '::error::The committed Kronos release package is damaged. Rebuild it from clean, directly versioned source before release.'
+            exit 1
+          fi
