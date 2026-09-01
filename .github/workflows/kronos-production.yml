@@ -2,7 +2,10 @@ name: Kronos Production Gate
 
 on:
   push:
-    branches: [production/kronos-paper-hardening]
+    branches: [production/kronos-paper-hardening, master]
+    paths:
+      - 'kronos-capital-os/source/**'
+      - '.github/workflows/kronos-production.yml'
   pull_request:
     branches: [master]
     paths:
@@ -10,7 +13,7 @@ on:
       - '.github/workflows/kronos-production.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   verify-paper-runtime:
@@ -45,6 +48,22 @@ jobs:
             echo '::error::Potential credential found in source.'
             exit 1
           fi
+      - name: Normalize safe mechanical issues
+        if: github.event_name == 'push' && github.ref == 'refs/heads/production/kronos-paper-hardening'
+        shell: bash
+        run: |
+          ruff check --fix kcos tests || true
+          ruff format kcos tests
+          cd ../..
+          if git diff --quiet -- kronos-capital-os/source/kcos kronos-capital-os/source/tests; then
+            echo 'Source is already normalized.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add kronos-capital-os/source/kcos kronos-capital-os/source/tests
+          git commit -m 'quality: normalize Kronos Python source'
+          git push origin HEAD:production/kronos-paper-hardening
       - name: Static analysis
         run: |
           ruff check kcos tests
