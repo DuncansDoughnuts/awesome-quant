@@ -41,13 +41,13 @@ jobs:
             echo 'Original ZIP is structurally valid.'
           else
             echo 'ORIGINAL_ZIP_VALID=false' >> "$GITHUB_ENV"
-            echo '::warning::Original ZIP is missing required archive structure; attempting recovery for inspection only.'
+            echo '::warning::Original ZIP is structurally invalid; recovering intact local records for inspection only.'
           fi
 
-      - name: Recover source from local ZIP records
+      - name: Recover intact source records
         shell: bash
         run: |
-          rm -rf /tmp/kronos-source
+          rm -rf /tmp/kronos-source /tmp/kronos-corrupt.txt
           mkdir -p /tmp/kronos-source
           python - <<'PY'
           from __future__ import annotations
@@ -59,9 +59,11 @@ jobs:
 
           archive = pathlib.Path('kronos-capital-os/Kronos_Capital_OS_Genesis_v0.1.zip')
           output_root = pathlib.Path('/tmp/kronos-source')
+          corrupt_file = pathlib.Path('/tmp/kronos-corrupt.txt')
           blob = archive.read_bytes()
           offset = 0
           recovered = 0
+          corrupt: list[str] = []
 
           while offset + 30 <= len(blob) and blob[offset:offset + 4] == b'PK\x03\x04':
               (
@@ -77,36 +79,40 @@ jobs:
                   name_len,
                   extra_len,
               ) = struct.unpack_from('<IHHHHHIIIHH', blob, offset)
-              if flags & 0x1:
-                  raise SystemExit('encrypted ZIP entries are not supported')
-              if flags & 0x8:
-                  raise SystemExit('streaming ZIP data descriptors are not recoverable safely')
-
               header_end = offset + 30
               name_start = header_end
               name_end = name_start + name_len
               data_start = name_end + extra_len
               data_end = data_start + compressed_size
               if data_end > len(blob):
-                  raise SystemExit('truncated compressed payload')
+                  corrupt.append('<truncated-final-entry>')
+                  break
 
-              name = blob[name_start:name_end].decode('utf-8')
+              name = blob[name_start:name_end].decode('utf-8', errors='strict')
               relative = pathlib.PurePosixPath(name)
               if relative.is_absolute() or '..' in relative.parts:
                   raise SystemExit(f'unsafe archive path: {name!r}')
+              if flags & 0x1 or flags & 0x8:
+                  corrupt.append(name)
+                  offset = data_end
+                  continue
 
               compressed = blob[data_start:data_end]
-              if method == 0:
-                  data = compressed
-              elif method == 8:
-                  data = zlib.decompress(compressed, -zlib.MAX_WBITS)
-              else:
-                  raise SystemExit(f'unsupported compression method {method} for {name!r}')
-
-              if len(data) != uncompressed_size:
-                  raise SystemExit(f'size mismatch for {name!r}')
-              if (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc:
-                  raise SystemExit(f'CRC mismatch for {name!r}')
+              try:
+                  if method == 0:
+                      data = compressed
+                  elif method == 8:
+                      data = zlib.decompress(compressed, -zlib.MAX_WBITS)
+                  else:
+                      raise ValueError(f'unsupported compression method {method}')
+                  if len(data) != uncompressed_size:
+                      raise ValueError('size mismatch')
+                  if (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc:
+                      raise ValueError('CRC mismatch')
+              except (ValueError, zlib.error):
+                  corrupt.append(name)
+                  offset = data_end
+                  continue
 
               destination = output_root / relative
               if name.endswith('/'):
@@ -119,22 +125,26 @@ jobs:
 
           if recovered == 0:
               raise SystemExit('no recoverable ZIP entries found')
+          corrupt_file.write_text('\n'.join(corrupt) + ('\n' if corrupt else ''), encoding='utf-8')
+          print(f'recovered {recovered} intact files')
+          print(f'corrupt entries: {len(corrupt)}')
+          for name in corrupt:
+              print(f'  - {name}')
           if offset != len(blob):
-              print(f'warning: {len(blob) - offset} trailing bytes were not part of local file records')
-          print(f'recovered {recovered} files from local ZIP records')
+              print(f'trailing unparsed bytes: {len(blob) - offset}')
           PY
           echo 'Recovered package manifest:'
           find /tmp/kronos-source -type f -printf '%P\n' | LC_ALL=C sort
 
-      - name: Block embedded secrets
+      - name: Block embedded secrets in recovered files
         shell: bash
         run: |
           if find /tmp/kronos-source -type f \( -name '.env' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .; then
-            echo '::error::Packaged source contains a secret-bearing file type. Store credentials outside the repository.'
+            echo '::error::Recovered source contains a secret-bearing file type. Store credentials outside the repository.'
             exit 1
           fi
           if grep -RIEq --binary-files=without-match '(-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,})' /tmp/kronos-source; then
-            echo '::error::Potential embedded credential detected in packaged source.'
+            echo '::error::Potential embedded credential detected in recovered source.'
             exit 1
           fi
 
@@ -145,11 +155,11 @@ jobs:
         shell: bash
         run: |
           test -n "$(find /tmp/kronos-source -name pyproject.toml -print -quit)" || {
-            echo '::error::No pyproject.toml found in packaged source.'
+            echo '::error::No recoverable pyproject.toml found.'
             exit 1
           }
           test -n "$(find /tmp/kronos-source -name Makefile -print -quit)" || {
-            echo '::error::No Makefile found in packaged source.'
+            echo '::error::No recoverable Makefile found.'
             exit 1
           }
 
@@ -161,10 +171,10 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
-      - name: Reject structurally invalid release archive
+      - name: Reject damaged release package
         shell: bash
         run: |
-          if [ "$ORIGINAL_ZIP_VALID" != 'true' ]; then
-            echo '::error::The committed Kronos release archive is structurally invalid. Rebuild and recommit a valid ZIP before release.'
+          if [ "$ORIGINAL_ZIP_VALID" != 'true' ] || [ -s /tmp/kronos-corrupt.txt ]; then
+            echo '::error::The committed Kronos release package is damaged. Rebuild it from clean, directly versioned source before release.'
             exit 1
           fi
