@@ -25,7 +25,13 @@ jobs:
 
       - name: Verify published checksum
         working-directory: kronos-capital-os
-        run: sha256sum --check SHA256SUMS
+        shell: bash
+        run: |
+          expected="$(awk 'NR==1 {print $1}' SHA256SUMS)"
+          actual="$(sha256sum Kronos_Capital_OS_Genesis_v0.1.zip | awk '{print $1}')"
+          echo "expected_sha256=$expected"
+          echo "actual_sha256=$actual"
+          test "$expected" = "$actual"
 
       - name: Verify ZIP integrity
         run: unzip -t kronos-capital-os/Kronos_Capital_OS_Genesis_v0.1.zip
