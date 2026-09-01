@@ -1,0 +1,67 @@
+name: Kronos Production Gate
+
+on:
+  push:
+    branches: [production/kronos-paper-hardening]
+  pull_request:
+    branches: [master]
+    paths:
+      - 'kronos-capital-os/source/**'
+      - '.github/workflows/kronos-production.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-paper-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: kronos-capital-os/source
+    env:
+      LIVE_TRADING_ENABLED: 'false'
+      AUTO_GRADUATE_TO_LIVE: 'false'
+      KRONOS_ENABLED: 'false'
+      DATABASE_URL: 'postgresql://kcos:kcos@127.0.0.1:5432/kcos'
+      REDIS_URL: 'redis://127.0.0.1:6379/0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: kronos-capital-os/source/pyproject.toml
+      - name: Install runtime and quality tooling
+        run: python -m pip install --disable-pip-version-check -e '.[dev]'
+      - name: Block committed secrets
+        shell: bash
+        run: |
+          if find . -type f \( -name '.env' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .; then
+            echo '::error::Secret-bearing file type found in tracked source.'
+            exit 1
+          fi
+          if grep -RIEq --exclude-dir=.git --exclude='*.md' '(-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,})' .; then
+            echo '::error::Potential credential found in source.'
+            exit 1
+          fi
+      - name: Static analysis
+        run: |
+          ruff check kcos tests
+          python -m compileall -q kcos tests
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Enforce safe production defaults
+        run: |
+          python - <<'PY'
+          from kcos.config import settings
+          assert settings.live_trading_enabled is False
+          assert settings.auto_graduate_to_live is False
+          assert settings.max_gross_leverage <= 1.0
+          assert settings.max_risk_per_trade_pct <= 0.5
+          print('paper-mode safety defaults verified')
+          PY
+      - name: CLI smoke test
+        run: kcos --help
+      - name: Container build
+        run: docker build -t kronos-capital-os:paper-production .
