@@ -32,7 +32,9 @@ def main() -> None:
     }
     env["OWNER_JURISDICTION"] = input("Owner jurisdiction [US]: ").strip() or "US"
     env["BASE_CURRENCY"] = input("Base currency [USD]: ").strip() or "USD"
-    env["INITIAL_CAPITAL"] = input("Starting simulated capital [1000]: ").strip() or "1000"
+    env["INITIAL_CAPITAL"] = (
+        input("Starting simulated capital [1000]: ").strip() or "1000"
+    )
 
     ibkr = yn("Connect Interactive Brokers for account/market-data access?")
     env["IBKR_ENABLED"] = str(ibkr).lower()
